@@ -1,0 +1,17 @@
+# C++ / CMake 编译产物
+build/
+cmake-build-*/
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dll
+*.exe
+
+# VS Code.vscode/
+
+# 日志与系统文件
+*.log
+.DS_Store
+Thumbs.db
