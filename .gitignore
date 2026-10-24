@@ -1,17 +1,15 @@
-# C++ / CMake 编译产物
+# Build directory
 build/
-cmake-build-*/
+
+# Compiled object files
 *.o
 *.obj
-*.a
-*.lib
-*.so
-*.dll
+
+# Executables
+*.out
 *.exe
 
-# VS Code.vscode/
+# IDE files
+.vscode/
+.idea/
 
-# 日志与系统文件
-*.log
-.DS_Store
-Thumbs.db
