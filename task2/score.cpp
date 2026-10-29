@@ -16,7 +16,7 @@ int main()
         scores.push_back(s);
 
     }
-\
+
     double sum=0;
     for (int i=0;i<scores.size();i++)
     {
