@@ -4,4 +4,4 @@ project(score_app)
 include_directories(include)
 
 add_executable(score_app main.cpp src/score_utils.cpp)
-'
+
