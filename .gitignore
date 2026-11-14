@@ -13,3 +13,11 @@ build/
 .vscode/
 .idea/
 
+task*/**/hello
+build/
+task2/score
+task2/swap
+
+install/
+log/
+*.save
