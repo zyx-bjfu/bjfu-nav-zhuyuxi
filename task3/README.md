@@ -90,7 +90,7 @@ odom 坐标系通过 TF2 变换连接到 base_link。
 两次调用 /supply_hp，返回 success=True，血量从 150 恢复到 200（达到上限）。
 运行录屏
 ![demo](docs/demo.gif)
-键盘驱动 RViz2 中 base_link 坐标系平滑移动的演示录屏见本任务 Issue 附件。
+键盘驱动 
 代码结构
 task3/src/rm_nav_demo/
 ├── CMakeLists.txt
