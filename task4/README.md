@@ -1,6 +1,6 @@
-# 任务四：Hello SLAM & Planning（第 5 周）
+# 任务四：Hello SLAM & Planning（第 5–6 周）
 
-基于 Ubuntu 22.04 + ROS 2 Humble，在 Gazebo 中部署 RMUL 赛场仿真，用 Point-LIO 完成建图并保存点云，再把点云转成 Nav2 可用的栅格地图，最后配置 AMCL 做重定位验证。
+基于 Ubuntu 22.04 + ROS 2 Humble，在 Gazebo 中部署 RMUL 赛场仿真，用 Point-LIO 完成建图并保存点云，把点云转成 Nav2 可用的栅格地图，配置 AMCL 做重定位验证（第 5 周）；再在这张真实栅格地图上手写 A* 规划器并对比启发函数（第 6 周）。
 
 ## 环境
 
@@ -18,6 +18,7 @@
 | 2 | 键盘绕场一周建图，`Ctrl+C` 保存 | `scans.pcd`（38 MB） |
 | 3 | 点云投影成二维占据栅格 | `rmul_map.pgm` + `rmul_map.yaml` |
 | 4 | 地图装入 `rm_nav_bringup`，`mode:=nav localization:=amcl` 重定位 | 位姿收敛 |
+| 5 | 在这张栅格上实现 8 邻域 A*，对比四种启发式 | `src/astar_planner` + 对比表 |
 
 ## 编译与运行
 
@@ -258,6 +259,129 @@ AMCL 的 `max_beams` 不是"取前 90 条有效回波"，而是在 1462 个角�
 
 > 诚实的边界：本次验证只覆盖约 0.5 m / 15° 量级的偏差。`recovery_alpha_slow/fast = 0` 时 AMCL 没有全局重定位能力，偏差再大（2 m 以上）仍会失败；要覆盖更大范围需改用 ICP 做 scan-to-map 配准。
 
+## A* 寻路与启发函数对比
+
+第 5 周把地图与定位链路跑通，第 6 周在这张真实栅格地图上做规划。
+
+### 实现
+
+`src/astar_planner/` 是一个独立的 ROS 2 功能包，算法核心与 ROS 节点分离：
+
+| 文件 | 作用 |
+|---|---|
+| `include/astar_planner/astar_planner.hpp` | 数据结构与 `AStarPlanner` 接口 |
+| `src/astar_planner.cpp` | 地图加载（YAML + P5 PGM 自解析）、A* 主体 |
+| `src/astar_node.cpp` | 命令行、`nav_msgs/Path` + `MarkerArray` 可视化 |
+| `tools/sweep.cpp` | 离线批量扫描，验证启发式最优性（不参与 colcon 构建） |
+
+核心库 `astar_core` 不依赖 `rclcpp`，可以脱离 ROS 环境单独用 `g++` 编译测试，算法正确性因此与 ROS 环境解耦。
+
+实现细节：
+
+- **8 邻域**，直走代价 1、对角代价 √2，单位是栅格边长（0.05 m）。
+- **对角切角检查**：对角移动要求两侧直邻格同时可通行，避免路径贴角穿过障碍。
+- **未知格按障碍处理**：灰度 205 的未观测区域不参与规划，宁可绕路也不走进未知区。
+- **地图解析自写**：YAML 只取 `image` / `resolution` / `origin`，PGM 按 P5 二进制格式手工解析（跳过 `#` 注释行），不引入 `yaml-cpp`。
+- **起终点自动选取**：缺省 `--start/--goal` 时取 `cx+cy` 最小与最大的两个自由格，并留 3 格膨胀余量，避免贴墙起步。
+
+四种启发式：Dijkstra（`h=0`）、曼哈顿（`(|dx|+|dy|)·res`）、欧氏（`√(dx²+dy²)·res`），以及额外加的 **octile**（`(|dx|+|dy|)+(√2−2)·min(|dx|,|dy|)` 再乘 `res`）。加第四条不是任务要求，而是为了给"曼哈顿为什么错"提供对照——假如只测三种，看到曼哈顿扩展节点少 98%、路径长度又碰巧相同，很容易得出"曼哈顿最好"的错误结论。
+
+### 编译与运行
+
+建议在独立工作空间里编译，避免在仓库目录下留 `build/ install/ log/`：
+
+```bash
+mkdir -p ~/ws_astar/src
+cp -r ~/bjfu-nav-zhuyuxi/task4/src/astar_planner ~/ws_astar/src/
+cd ~/ws_astar
+colcon build --packages-select astar_planner
+source install/setup.bash
+```
+
+纯离线跑一次对比（不开 ROS，只打印表格并输出 PGM）：
+
+```bash
+ros2 run astar_planner astar_node --no-publish --out-pgm /tmp/astar_paths.pgm
+```
+
+RViz 可视化（节点启动后 8 秒内持续发布，Fixed Frame 设为 `map`）：
+
+```bash
+ros2 run astar_planner astar_node --start -3.417 -3.692 --goal 9.283 6.009
+```
+
+发布的话题：
+
+- `/astar/path`（`nav_msgs/Path`）：欧氏启发式找到的路径
+- `/astar/markers`（`MarkerArray`）：四条路径折线 + 起终点球
+
+### 实测对比
+
+测试地图就是第 5 周建出来的 `map/rmul_map.pgm`（297 × 243，0.05 m/cell，覆盖约 14.9 m × 12.2 m）。全部数字在同一次编译产物上跑出，`-Wall -Wextra -Wpedantic` 零警告。
+
+耗时一列有个坑要先说明：`colcon build` 默认不设 `CMAKE_BUILD_TYPE`，gcc 会停在 `-O0`，同一份代码在 Case A 的 Dijkstra 上实测 **10.64 ms**，比 Release 慢 5 倍，会直接把"搜索够不够快"的结论读反。本包在 `CMakeLists.txt` 里默认切到 Release，下表全部是 `-O3 -DNDEBUG` 的结果；读者复现时不要手动传 `-DCMAKE_BUILD_TYPE=Debug`。
+
+**案例 A：长对角**
+
+起点 `(-3.417, -3.692)` → 终点 `(9.283, 6.009)`，直线距离 15.98 m。
+
+| 启发式 | 扩展节点 | 相对 Dijkstra | 路径点数 | 路径长度 | 耗时 |
+|---|---|---|---|---|---|
+| Dijkstra（h=0） | 29354 | — | 423 | 21.638 m | 2.05 ms |
+| 曼哈顿 | 604 | −97.9% | 423 | 21.638 m | 0.07 ms |
+| 欧氏 | 9057 | −69.1% | 423 | 21.638 m | 0.94 ms |
+| octile | 8353 | −71.5% | 423 | 21.638 m | 0.91 ms |
+
+![案例 A：长对角](docs/astar_case_a.png)
+
+这一组里四种启发式的路径**长度完全相同**：该起终点之间的最优路径基本由场地几何决定（只能绕外圈），差别只在搜得多快。曼哈顿比 Dijkstra 少扩展 97.9%，路径却一厘米没短——第一眼看像是"白赚"，案例 B 会说明代价在哪。
+
+（97.9% 这个降幅比全图平均的 66.0% 夸张，是因为这组起终点的 |dx| 与 |dy| 接近（12.7 : 9.7），曼哈顿对对角步的高估最严重，搜索几乎塌缩成直线冲刺。）
+
+**案例 B：曼哈顿次优最严重的一组**
+
+起点 `(-0.567, 4.759)` → 终点 `(9.033, -3.641)`，直线距离 12.76 m。取自批量扫描的最坏样本。
+
+| 启发式 | 扩展节点 | 相对 Dijkstra | 路径点数 | 路径长度 | 耗时 |
+|---|---|---|---|---|---|
+| Dijkstra（h=0） | 32824 | — | 250 | 14.749 m | 2.11 ms |
+| 曼哈顿 | 4490 | −86.3% | 301 | **16.367 m** | 0.42 ms |
+| 欧氏 | 15219 | −53.6% | 250 | 14.749 m | 1.94 ms |
+| octile | 11434 | −65.2% | 250 | 14.749 m | 1.53 ms |
+
+![案例 B：曼哈顿次优](docs/astar_case_b.png)
+
+曼哈顿扩展的节点最少、跑得最快，路径却比最优长 **1.618 m（+11.0%）**，点数也多出 51 个：它在图上绕开了原本可以直接斜穿的空地。原因见结论第 1 条。
+
+### 批量验证
+
+单组案例只能说明"可能错"，不能说明"多容易错"。`tools/sweep.cpp` 在整张图上按 24 格步长取自由格两两组合，得到 4290 对起终点，逐对跑四种启发式：
+
+```bash
+cd ~/bjfu-nav-zhuyuxi/task4/src/astar_planner
+g++ -std=c++17 -O2 -Iinclude src/astar_planner.cpp tools/sweep.cpp -o /tmp/sweep
+/tmp/sweep ../../map/rmul_map.yaml
+```
+
+| 启发式 | 总扩展节点 | 平均扩展 | 次优次数 | 最坏路径差 |
+|---|---|---|---|---|
+| Dijkstra（h=0） | 101,081,122 | 23562.0 | 0 | 0 |
+| 曼哈顿 | 34,399,106 | **8018.4** | **227 / 4290（5.3%）** | **+1.618 m** |
+| 欧氏 | 46,846,664 | 10920.0 | 0 | 0 |
+| octile | 42,009,106 | 9792.3 | 0 | 0 |
+
+### 结论
+
+1. **曼哈顿在 8 邻域下不可采纳。** 直走一格代价 1、对角一格代价 √2 ≈ 1.414，而曼哈顿按 `|dx|+|dy|` 计，对角走一步它算 2，**高估了 0.586**。启发函数一旦高估，A* 会在还没搜到更优路径时就认为"这条路不可能更好"而剪枝，于是结果可能不是最短的。4290 对里 227 对（5.3%）因此次优，最坏多走 1.618 m。它扩展节点少（−66.0%）不是因为聪明，恰恰是因为"算错了所以搜得少"。
+2. **欧氏可采纳，代价是扩展量。** `√(dx²+dy²)` 永远不大于真实代价，因此 4290 对全部最优；但它对对角方向低估得多，估计偏松，扩展量比曼哈顿多 36%（平均 8018 → 10920），仍是 Dijkstra 的 46%。
+3. **octile 是 8 邻域下的正确"紧"启发。** `(|dx|+|dy|)+(√2−2)·min(|dx|,|dy|)` 恰好等于无障碍时的真实步数代价，可采纳且一致，因此路径全部最优；同时比欧氏再少 10.3% 的扩展量（10920 → 9792）。要在实时性和最优性之间取平衡，应当用 octile，而不是用会出错的曼哈顿。
+4. **搜索不是瓶颈。** 297 × 243 的栅格上单次规划最坏 2.11 ms（Dijkstra，扩展 32824 个节点），四条启发式都在 0.07–2.11 ms。即便按 10 Hz 做局部重规划，也只占单核 2.1% 的时间；真正吃时间的是代价地图刷新与碰撞检查，不是 A* 本身。
+
+### 复现说明
+
+- 全部表格数字来自 `--no-publish` 的离线路径，不依赖 Gazebo、不依赖 RViz，只需要一张 `rmul_map.pgm` + `rmul_map.yaml`。
+- `docs/astar_case_a.png` / `docs/astar_case_b.png` 由同一份路径点数据叠加到栅格上绘制：蓝线 Dijkstra、紫线 octile、红线曼哈顿；欧氏与 Dijkstra 等长时不再单独画，避免互相遮挡。
+
 ## 踩坑记录
 
 - `pointlio_mid360_sim.yaml` 里 `pcd_save_en` 默认是 `false`，不改就永远不落盘（`fastlio_mid360_sim.yaml` 那份默认是 `true`，容易混淆）
@@ -279,11 +403,23 @@ AMCL 的 `max_beams` 不是"取前 90 条有效回波"，而是在 1462 个角�
 task4/
 ├── README.md
 ├── tools/
-│   └── pcd2pgm.py          # 点云转栅格地图
+│   └── pcd2pgm.py            # 点云转栅格地图
 ├── map/
-│   ├── rmul_map.pgm        # 栅格地图
-│   └── rmul_map.yaml       # map_server 配置
-└── docs/
-    ├── mapping_rviz.png    # 建图过程截图
-    └── map_pgm.png         # 转换后的地图
+│   ├── rmul_map.pgm          # 栅格地图
+│   └── rmul_map.yaml         # map_server 配置
+├── docs/
+│   ├── mapping_rviz.png      # 建图过程截图
+│   ├── map_pgm.png           # 转换后的地图
+│   ├── astar_case_a.png      # 启发式对比：长对角
+│   └── astar_case_b.png      # 启发式对比：曼哈顿次优
+└── src/
+    └── astar_planner/        # 第 6 周 A* 功能包
+        ├── CMakeLists.txt
+        ├── package.xml
+        ├── include/astar_planner/astar_planner.hpp
+        ├── src/
+        │   ├── astar_planner.cpp   # 地图加载 + A* 主体
+        │   └── astar_node.cpp      # 命令行 + RViz 可视化
+        └── tools/
+            └── sweep.cpp           # 离线批量验证（不参与构建）
 ```
